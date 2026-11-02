@@ -16,6 +16,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardMarkup, KeyboardButton, 
                            ReplyKeyboardMarkup)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import autopay
 import config
 from catalog import CATEGORIES, SERVERS, get_item
 from db import DB
@@ -231,18 +232,29 @@ async def create_topup_request(target, user_id: int, amount: int, state: FSMCont
         text = f"❌ Summa {money(config.TOPUP_MIN)} dan {money(config.TOPUP_MAX)} gacha bo'lishi kerak."
         await render(target, text)
         return
-    tid = await db.create_topup(user_id, amount, config.TOPUP_TTL_MIN)
+    tid, pay = await db.create_topup(
+        user_id, amount, config.TOPUP_TTL_MIN, config.AUTOPAY_GRACE_MIN, config.TOPUP_OFFSET_MAX)
     await state.set_state(TopUp.proof)
     await state.update_data(topup_id=tid)
     b = InlineKeyboardBuilder()
     b.button(text="❌ Bekor qilish", callback_data=f"tc:{tid}")
+    if config.AUTOPAY_ENABLED:
+        tail = (
+            "❗ <b>Aynan shu summani</b> (so'mgacha) o'tkazing — to'lov avtomatik aniqlanadi.\n"
+            "✅ Chek yuborish shart emas. 5 daqiqada balansga tushmasa, chekni shu chatga yuboring."
+        )
+    else:
+        tail = (
+            "❗ Aynan shu summani o'tkazing.\n"
+            "📸 To'lovdan so'ng <b>chekni (skrinshotni)</b> shu chatga yuboring."
+        )
     msg = (
         "⚡ <b>To'lov yaratildi!</b>\n\n"
         f"💳 Karta: <code>{card_fmt()}</code>\n"
         f"👤 Karta egasi: <b>{esc(config.CARD_HOLDER)}</b>\n"
-        f"💰 O'tkazma summasi: <b>{money(amount)}</b>\n\n"
-        "❗ Aynan shu summani o'tkazing.\n"
-        "📸 To'lovdan so'ng <b>chekni (skrinshotni)</b> shu chatga yuboring.\n\n"
+        f"💰 O'tkazma summasi: <b>{money(pay)}</b>\n"
+        f"🎁 Balansga tushadi: <b>{money(amount)}</b>\n\n"
+        f"{tail}\n\n"
         f"⏳ Muddat: {config.TOPUP_TTL_MIN} daqiqa"
     )
     if isinstance(target, CallbackQuery):
@@ -299,11 +311,12 @@ async def got_proof(m: Message, state: FSMContext):
         f"💳 <b>Yangi to'lov #{tid}</b>\n\n"
         f"👤 {esc(m.from_user.full_name)} ({uname})\n"
         f"🆔 <code>{m.from_user.id}</code>\n"
-        f"💰 Summa: <b>{money(topup['amount'])}</b>"
+        f"💰 Balansga: <b>{money(topup['amount'])}</b>\n"
+        f"💳 O'tkazilishi kerak: <b>{money(topup['pay_amount'] or topup['amount'])}</b>"
     )
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Pul tushdi", callback_data=f"tp:ok:{tid}")
-    kb.button(text="❌ Rad etish", callback_data=f"tp:no:{tid}")
+    kb.button(text="✅ Tasdiqlash", callback_data=f"tp:ok:{tid}")
+    kb.button(text="❌ Noto'g'ri", callback_data=f"tp:no:{tid}")
     kb.adjust(2)
     for aid in config.ADMIN_IDS:
         try:
@@ -336,7 +349,7 @@ async def cb_admin_topup(c: CallbackQuery):
             pass
         return
     await c.answer("Bajarildi")
-    verdict = "✅ QABUL QILINDI" if approve else "❌ RAD ETILDI"
+    verdict = "✅ TASDIQLANDI" if approve else "❌ NOTO'G'RI"
     try:
         await c.message.edit_caption(
             caption=f"{c.message.caption or ''}\n\n<b>{verdict}</b> — {esc(c.from_user.full_name)}",
@@ -349,13 +362,13 @@ async def cb_admin_topup(c: CallbackQuery):
             u = await db.get_user(row["user_id"])
             await bot.send_message(
                 row["user_id"],
-                f"✅ <b>To'lov tasdiqlandi!</b>\n\n+{money(row['amount'])}\n💰 Balansingiz: <b>{money(u['balance'])}</b>",
+                f"✅ <b>Pul tushdi!</b>\n\n+{money(row['amount'])}\n💰 Balansingiz: <b>{money(u['balance'])}</b>",
             )
         else:
             sup = f" @{esc(config.SUPPORT_USERNAME)}" if config.SUPPORT_USERNAME else ""
             await bot.send_message(
                 row["user_id"],
-                f"❌ <b>To'lov #{row['id']} rad etildi.</b>\nMuammo bo'lsa admin bilan bog'laning.{sup}",
+                f"❌ <b>To'lov #{row['id']} noto'g'ri deb topildi.</b>\nMuammo bo'lsa admin bilan bog'laning.{sup}",
             )
     except Exception as e:
         log.warning("Foydalanuvchiga xabar yuborilmadi: %s", e)
@@ -666,8 +679,21 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
+    client = None
+    if config.AUTOPAY_ENABLED:
+        try:
+            client = await autopay.start(bot, db)
+        except Exception as e:
+            log.exception("Avto-to'lov ishga tushmadi")
+            await notify_admins(f"⚠️ Avto-to'lov ishga tushmadi, qo'lda tasdiqlash ishlayveradi.\n<code>{esc(e)}</code>")
+    else:
+        log.info("Avto-to'lov o'chiq (TG_API_ID/TG_API_HASH/TG_SESSION yo'q) — qo'lda tasdiqlash")
     log.info("Bot ishga tushdi")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if client:
+            await client.disconnect()
 
 
 if __name__ == "__main__":

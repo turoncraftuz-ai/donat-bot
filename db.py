@@ -1,6 +1,7 @@
 """SQLite baza (standart kutubxona). Barcha yozuvlar bitta lock ostida bajariladi."""
 import asyncio
 import os
+import random
 import sqlite3
 import time
 
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS topups(
     amount INTEGER NOT NULL,
     status TEXT NOT NULL,            -- waiting, review, approved, rejected, cancelled
     proof_file_id TEXT,
+    pay_amount INTEGER,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     decided_by INTEGER,
@@ -38,6 +40,13 @@ CREATE TABLE IF NOT EXISTS purchases(
     created_at INTEGER NOT NULL,
     delivered_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS processed_payments(
+    chat_id INTEGER NOT NULL,
+    msg_id INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(chat_id, msg_id)
+);
 """
 
 
@@ -52,6 +61,9 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(topups)").fetchall()]
+        if "pay_amount" not in cols:  # eski bazani yangilash
+            self.conn.execute("ALTER TABLE topups ADD COLUMN pay_amount INTEGER")
 
     # --- ichki yordamchilar -------------------------------------------------
     def _one(self, sql, args=()):
@@ -105,16 +117,25 @@ class DB:
         return await self._run(f)
 
     # --- balans to'ldirish --------------------------------------------------
-    async def create_topup(self, user_id, amount, ttl_min):
+    async def create_topup(self, user_id, amount, ttl_min, grace_min=15, max_offset=99):
+        """To'lov so'rovi yaratadi. Qaytaradi: (id, pay_amount). pay_amount - noyob (amount + 1..99 so'm)."""
         def f():
             def tx(c):
                 c.execute("UPDATE topups SET status='cancelled' WHERE user_id=? AND status='waiting'", (user_id,))
                 now = int(time.time())
+                rows = c.execute(
+                    "SELECT pay_amount FROM topups WHERE pay_amount IS NOT NULL AND "
+                    "(status='review' OR (status='waiting' AND expires_at>=?))", (now - grace_min * 60,)).fetchall()
+                used = {r["pay_amount"] for r in rows}
+                offsets = list(range(1, max_offset + 1))
+                random.shuffle(offsets)
+                offsets += list(range(max_offset + 1, 1000))
+                pay = amount if max_offset <= 0 else next((amount + o for o in offsets if amount + o not in used), amount)
                 cur = c.execute(
-                    "INSERT INTO topups(user_id, amount, status, created_at, expires_at) VALUES(?,?,?,?,?)",
-                    (user_id, amount, "waiting", now, now + ttl_min * 60),
+                    "INSERT INTO topups(user_id, amount, status, pay_amount, created_at, expires_at) VALUES(?,?,?,?,?,?)",
+                    (user_id, amount, "waiting", pay, now, now + ttl_min * 60),
                 )
-                return cur.lastrowid
+                return cur.lastrowid, pay
             return self._tx(tx)
         return await self._run(f)
 
@@ -153,6 +174,32 @@ class DB:
                 row = c.execute("SELECT * FROM topups WHERE id=?", (topup_id,)).fetchone()
                 if approve:
                     c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (row["amount"], row["user_id"]))
+                return row
+            return self._tx(tx)
+        return await self._run(f)
+
+    async def register_payment(self, chat_id, msg_id, amount):
+        """Bank xabarini bir marta qayta ishlash uchun. Yangi bo'lsa True."""
+        def f():
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO processed_payments(chat_id, msg_id, amount, created_at) VALUES(?,?,?,?)",
+                (chat_id, msg_id, amount, int(time.time())))
+            return cur.rowcount == 1
+        return await self._run(f)
+
+    async def auto_approve(self, pay_amount, grace_min=15):
+        """Kelgan summaga mos so'rovni topib tasdiqlaydi va balansni to'ldiradi. Topilmasa None."""
+        def f():
+            def tx(c):
+                row = c.execute(
+                    "SELECT * FROM topups WHERE pay_amount=? AND "
+                    "(status='review' OR (status='waiting' AND expires_at>=?)) ORDER BY id DESC LIMIT 1",
+                    (pay_amount, int(time.time()) - grace_min * 60)).fetchone()
+                if row is None:
+                    return None
+                c.execute("UPDATE topups SET status='approved', decided_by=0, decided_at=? WHERE id=?",
+                          (int(time.time()), row["id"]))
+                c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (row["amount"], row["user_id"]))
                 return row
             return self._tx(tx)
         return await self._run(f)
